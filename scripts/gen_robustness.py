@@ -32,7 +32,9 @@ from euphonic import ureg
 
 # ---- 模型 ----
 
-from model2 import SRCNN, PowderUNet, FNO2d
+import sys, os
+sys.path.append(os.path.dirname(__file__))
+from model import SRCNN, PowderUNet, FNO2d
 
 # ============== 配置 ==============
 
@@ -42,6 +44,8 @@ MATPROJ_APIKEY = 'LvxElbvFT1ttFZLGiLgvtWPxN442GVdr'
 
 BLACKLIST = {"Ac", "Th", "Pa", "U", "Np", "Pu"}
 
+SEED = 1001
+import random
 
 # ---------- utils ----------
 
@@ -64,6 +68,11 @@ def sanitize(arr, clip_pct=99.9, nonneg=True):
     return a
 
 
+class myMPDoc():
+    def __init__(self, m_id, ele, ns):
+        self.material_id, self.elements, self.nsites = (m_id, ele, ns)
+
+
 def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
 
                  blacklist=BLACKLIST, oversample=10):
@@ -77,17 +86,21 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
 
     with MPRester(api_key=api_key) as mpr:
 
-        docs = mpr.materials.summary.search(
+        docs_fname = f'mpr_docs_nelem{num_elements}.npy'
+        if os.path.exists(docs_fname):
+            docs = np.load(docs_fname, allow_pickle=True)
+        else:
+            docs = mpr.materials.summary.search(
+                fields=["material_id", "elements", "nsites"],
+                num_elements=num_elements,
+                is_stable=True
+            )
+            np.save(docs_fname, [myMPDoc(d.material_id, d.elements, d.nsites) for d in docs])
 
-            fields=["material_id", "elements", "nsites"],
-
-            num_elements=num_elements,
-
-            is_stable=True
-
-        )
-
-        for d in docs:
+        random.seed(1001)
+        #for d in docs:
+        for idd in random.choices(range(len(docs)), k=hard_cap*2):
+            d = docs[idd]
 
             if d.nsites is not None and d.nsites > nsites_max:
                 continue
@@ -105,13 +118,15 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
     return ids
 
 
-def gen_single(mp_id, do_plot=False):
+def gen_single(mp_id, do_plot=False, no_load=False):
+    outnpy = f'janus_results/{mp_id}-powder.npy'
+    if os.path.exists(outnpy) and not no_load:
+        calc = np.load(outnpy, allow_pickle=True)
+        return calc[0].flatten(), calc[1].flatten()
+        
     with MPRester(api_key=MATPROJ_APIKEY) as mp:
-
         struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
-
             mp.get_structure_by_material_id(mp_id)
-
         )
 
     # 二次防护：如果有黑名单元素，直接跳过（避免后续 Debye-Waller 报错）
@@ -127,25 +142,18 @@ def gen_single(mp_id, do_plot=False):
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ph = Phonons(
+    if not os.path.exists(f'janus_results/{formula}-phonopy.yml') or not os.path.exists(f'janus_results/{formula}-force_constants.hdf5'):
+        ph = Phonons(
+            struct=struct.copy(), arch="mace_mp", device=device_str, model="small",
+            calc_kwargs={"default_dtype": "float64"},
+            supercell=[2, 2, 2], displacement=0.01, temp_step=2.0, temp_min=0.0, temp_max=2000.0,
+            minimize=True,
+            minimize_kwargs={"filter_kwargs": {"hydrostatic_strain": False}, "fmax": 0.1, "optimizer": "MDMin"},
+            force_consts_to_hdf5=True, plot_to_file=False, symmetrize=False, write_full=True, write_results=True,
+        )
+        ph.calc_force_constants()
 
-        struct=struct.copy(), arch="mace_mp", device=device_str, model="small",
-
-        calc_kwargs={"default_dtype": "float64"},
-
-        supercell=[2, 2, 2], displacement=0.01, temp_step=2.0, temp_min=0.0, temp_max=2000.0,
-
-        minimize=True,
-
-        minimize_kwargs={"filter_kwargs": {"hydrostatic_strain": False}, "fmax": 0.1, "optimizer": "MDMin"},
-
-        force_consts_to_hdf5=True, plot_to_file=False, symmetrize=False, write_full=True, write_results=True,
-
-    )
-
-    ph.calc_force_constants()
-
-    ph.calc_bands(write_bands=True)
+    #ph.calc_bands(write_bands=True)
 
     fc = euphonic.ForceConstants.from_phonopy(
 
@@ -199,6 +207,8 @@ def gen_single(mp_id, do_plot=False):
 
     if not (np.all(np.isfinite(z_coarse)) and np.all(np.isfinite(z_high))):
         raise ValueError("non-finite values in z_coarse/z_high")
+    if not no_load:
+        np.save(outnpy, np.array([z_coarse, z_high], dtype=object))
 
     return z_coarse.flatten(), z_high.flatten()
 
@@ -313,7 +323,7 @@ def main():
 
     parser.add_argument('--limit', type=int, default=60)
 
-    parser.add_argument('--speed-mpid', type=str, default=None)
+    parser.add_argument('--speed-mpid', type=str, default='mp-8566')
 
     args = parser.parse_args()
 
@@ -394,7 +404,7 @@ def main():
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5, verbose=True)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)#, verbose=True)
 
     # ========== 训练 ==========
 
@@ -569,7 +579,7 @@ def main():
 
     t0 = time.time()
 
-    zc_vec, zh_vec = gen_single(speed_mpid, do_plot=False)
+    zc_vec, zh_vec = gen_single(speed_mpid, do_plot=False, no_load=True)
 
     t_brute = time.time() - t0
 
