@@ -19,6 +19,7 @@ from sklearn.model_selection import train_test_split
 from mp_api.client import MPRester
 
 import pymatgen.io.ase
+import ase
 
 from janus_core.calculations.phonons import Phonons
 
@@ -124,11 +125,16 @@ def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_s
         calc = np.load(outnpy, allow_pickle=True)
         if calc[0].shape == input_size and calc[1].shape == output_size:
             return calc[0].flatten(), calc[1].flatten()
-        
-    with MPRester(api_key=MATPROJ_APIKEY) as mp:
-        struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
-            mp.get_structure_by_material_id(mp_id)
-        )
+
+    structnpy = f'janus_results/{mp_id}-struct.npy'
+    if os.path.exists(structnpy):
+        struct = ase.Atoms(np.load(structnpy, allow_pickle=True).tolist())
+    else:
+        with MPRester(api_key=MATPROJ_APIKEY) as mp:
+            struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
+                mp.get_structure_by_material_id(mp_id)
+            )
+        np.save(structnpy, struct)
 
     # 二次防护：如果有黑名单元素，直接跳过（避免后续 Debye-Waller 报错）
 
