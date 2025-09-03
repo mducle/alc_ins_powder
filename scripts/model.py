@@ -5,9 +5,9 @@ import torch.fft as fft
 
 # -------- SRCNN（输出残差） --------
 class SRCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, scale_factor=(5, 10)):
         super().__init__()
-        self.pre = nn.Upsample(scale_factor=(5, 10), mode='bilinear', align_corners=False)
+        self.pre = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
         self.net = nn.Sequential(
             nn.Conv2d(1, 64, 9, padding=4), nn.ReLU(inplace=True),
             nn.Conv2d(64, 32, 1), nn.ReLU(inplace=True),
@@ -21,11 +21,11 @@ class SRCNN(nn.Module):
 
 # -------- U-Net（输出残差） --------
 class PowderUNet(nn.Module):
-    def __init__(self):
+    def __init__(self, scale_factor=(5, 10)):
         super().__init__()
         self.enc1 = nn.Sequential(nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(inplace=True))
         self.enc2 = nn.Sequential(nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True))
-        self.up = nn.Upsample(scale_factor=(5, 10), mode='bilinear', align_corners=False)
+        self.up = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
         self.dec1 = nn.Sequential(nn.Conv2d(96, 32, 3, padding=1), nn.ReLU(inplace=True))
         self.dec2 = nn.Conv2d(32, 1, 3, padding=1)
 

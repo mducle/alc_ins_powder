@@ -118,11 +118,12 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
     return ids
 
 
-def gen_single(mp_id, do_plot=False, no_load=False):
+def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_size=(100,200)):
     outnpy = f'janus_results/{mp_id}-powder.npy'
     if os.path.exists(outnpy) and not no_load:
         calc = np.load(outnpy, allow_pickle=True)
-        return calc[0].flatten(), calc[1].flatten()
+        if calc[0].shape == input_size and calc[1].shape == output_size:
+            return calc[0].flatten(), calc[1].flatten()
         
     with MPRester(api_key=MATPROJ_APIKEY) as mp:
         struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
@@ -169,11 +170,11 @@ def gen_single(mp_id, do_plot=False, no_load=False):
 
     # 高分辨率
 
-    qbins_h = np.linspace(0, 6, 101) * ureg('1 / angstrom')
+    qbins_h = np.linspace(0, 6, output_size[0]+1) * ureg('1 / angstrom')
 
     qc_h = (qbins_h[:-1] + qbins_h[1:]) / 2
 
-    ebins_h = np.linspace(0, 60, 201) * ureg('meV')
+    ebins_h = np.linspace(0, 60, output_size[1]+1) * ureg('meV')
 
     z_high = np.empty((len(qc_h), len(ebins_h) - 1))
 
@@ -188,11 +189,11 @@ def gen_single(mp_id, do_plot=False, no_load=False):
 
     # 粗分辨率
 
-    qbins_c = np.linspace(0, 6, 21) * ureg('1 / angstrom')
+    qbins_c = np.linspace(0, 6, input_size[0]+1) * ureg('1 / angstrom')
 
     qc_c = (qbins_c[:-1] + qbins_c[1:]) / 2
 
-    ebins_c = np.linspace(0, 60, 21) * ureg('meV')
+    ebins_c = np.linspace(0, 60, input_size[1]+1) * ureg('meV')
 
     z_coarse = np.empty((len(qc_c), len(ebins_c) - 1))
 
@@ -213,7 +214,7 @@ def gen_single(mp_id, do_plot=False, no_load=False):
     return z_coarse.flatten(), z_high.flatten()
 
 
-def collect_samples(mp_ids, need_n=None):
+def collect_samples(mp_ids, need_n=None, input_size=(20,20), output_size=(100,200)):
     """按需收集样本：凑够 need_n 个成功样本就停止；失败样本记录但不终止整轮。"""
 
     need_n = need_n or len(mp_ids)
@@ -227,7 +228,7 @@ def collect_samples(mp_ids, need_n=None):
 
         try:
 
-            inp, tgt = gen_single(mpid, do_plot=False)
+            inp, tgt = gen_single(mpid, do_plot=False, input_size=input_size, output_size=output_size)
 
             if not (np.all(np.isfinite(inp)) and np.all(np.isfinite(tgt))):
                 raise ValueError("non-finite values in sample")
@@ -324,8 +325,12 @@ def main():
     parser.add_argument('--limit', type=int, default=60)
 
     parser.add_argument('--speed-mpid', type=str, default='mp-8566')
+    parser.add_argument('--input-size', type=str, default='20x20')
+    parser.add_argument('--output-size', type=str, default='100x200')
 
     args = parser.parse_args()
+    SIZEX_IN, SIZEY_IN = (int(v) for v in args.input_size.split('x'))
+    SIZEX_OUT, SIZEY_OUT = (int(v) for v in args.output_size.split('x'))
 
     # ========== 采集数据 ==========
 
@@ -338,7 +343,7 @@ def main():
     if not mp_ids:
         raise RuntimeError("No candidate mp_ids fetched. Check API key/filters.")
 
-    inputs, targets, ok_ids, errors = collect_samples(mp_ids, need_n=args.limit)
+    inputs, targets, ok_ids, errors = collect_samples(mp_ids, need_n=args.limit, input_size=(SIZEX_IN, SIZEY_IN), output_size=(SIZEX_OUT, SIZEY_OUT))
 
     if len(inputs) < 1:
 
@@ -360,9 +365,9 @@ def main():
 
     sx, sy = MinMaxScaler(), MinMaxScaler()
 
-    Xs = sx.fit_transform(X).reshape(-1, 1, 20, 20)
+    Xs = sx.fit_transform(X).reshape(-1, 1, SIZEX_IN, SIZEY_IN)
 
-    Ys = sy.fit_transform(Y).reshape(-1, 1, 100, 200)
+    Ys = sy.fit_transform(Y).reshape(-1, 1, SIZEX_OUT, SIZEY_OUT)
 
     X_tr, X_val, y_tr, y_val = train_test_split(Xs, Ys, test_size=0.2, random_state=0)
 
@@ -382,11 +387,11 @@ def main():
 
     if args.model == 'srcnn':
 
-        net = SRCNN()
+        net = SRCNN(scale_factor=(SIZEX_OUT/SIZEX_IN, SIZEY_OUT/SIZEY_IN))
 
     elif args.model == 'unet':
 
-        net = PowderUNet()
+        net = PowderUNet(scale_factor=(SIZEX_OUT/SIZEX_IN, SIZEY_OUT/SIZEY_IN))
 
     else:
 
@@ -425,7 +430,7 @@ def main():
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
 
-            base = nn.functional.interpolate(xb, size=(100, 200), mode='bilinear', align_corners=False)
+            base = nn.functional.interpolate(xb, size=(SIZEX_OUT, SIZEY_OUT), mode='bilinear', align_corners=False)
 
             res = net(xb)
 
@@ -474,7 +479,7 @@ def main():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
 
-                base = nn.functional.interpolate(xb, size=(100, 200), mode='bilinear', align_corners=False)
+                base = nn.functional.interpolate(xb, size=(SIZEX_OUT, SIZEY_OUT), mode='bilinear', align_corners=False)
 
                 pred = (base + net(xb)).clamp(0.0, 1.0)
 
@@ -579,7 +584,7 @@ def main():
 
     t0 = time.time()
 
-    zc_vec, zh_vec = gen_single(speed_mpid, do_plot=False, no_load=True)
+    zc_vec, zh_vec = gen_single(speed_mpid, do_plot=False, no_load=True, input_size=(SIZEX_IN, SIZEY_IN), output_size=(SIZEX_OUT, SIZEY_OUT))
 
     t_brute = time.time() - t0
 
@@ -589,13 +594,13 @@ def main():
 
     zc_scaled = (zc - sx.data_min_) / (sx.data_max_ - sx.data_min_ + 1e-12)
 
-    x = torch.from_numpy(zc_scaled.reshape(1, 1, 20, 20)).float().to(device)
+    x = torch.from_numpy(zc_scaled.reshape(1, 1, SIZEX_IN, SIZEY_IN)).float().to(device)
 
     with torch.no_grad():
 
         t1 = time.time()
 
-        base = nn.functional.interpolate(x, size=(100, 200), mode='bilinear', align_corners=False)
+        base = nn.functional.interpolate(x, size=(SIZEX_OUT, SIZEY_OUT), mode='bilinear', align_corners=False)
 
         res = net(x)
 
@@ -616,9 +621,9 @@ def main():
 
     y_log = inverse_scale(y_scaled_np, sy)
 
-    y_pred = np.expm1(y_log).reshape(100, 200)
+    y_pred = np.expm1(y_log).reshape(SIZEX_OUT, SIZEY_OUT)
 
-    y_true = zh_vec.reshape(100, 200)
+    y_true = zh_vec.reshape(SIZEX_OUT, SIZEY_OUT)
 
     vmin = 0.0
 
