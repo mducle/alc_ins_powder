@@ -408,7 +408,7 @@ def main():
 
     else:
 
-        net = FNO2d(modes1=20, modes2=10, width=64)
+        net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
