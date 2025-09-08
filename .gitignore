@@ -1,0 +1,8 @@
+__pycache__
+
+*.swp
+*.swo
+
+checkpoints*
+janus_results*
+mpr_docs_nelem*

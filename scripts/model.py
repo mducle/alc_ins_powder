@@ -5,9 +5,9 @@ import torch.fft as fft
 
 # -------- SRCNN（输出残差） --------
 class SRCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, scale_factor=(5, 10)):
         super().__init__()
-        self.pre = nn.Upsample(scale_factor=(5, 10), mode='bilinear', align_corners=False)
+        self.pre = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
         self.net = nn.Sequential(
             nn.Conv2d(1, 64, 9, padding=4), nn.ReLU(inplace=True),
             nn.Conv2d(64, 32, 1), nn.ReLU(inplace=True),
@@ -21,11 +21,11 @@ class SRCNN(nn.Module):
 
 # -------- U-Net（输出残差） --------
 class PowderUNet(nn.Module):
-    def __init__(self):
+    def __init__(self, scale_factor=(5, 10)):
         super().__init__()
         self.enc1 = nn.Sequential(nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(inplace=True))
         self.enc2 = nn.Sequential(nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True))
-        self.up = nn.Upsample(scale_factor=(5, 10), mode='bilinear', align_corners=False)
+        self.up = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
         self.dec1 = nn.Sequential(nn.Conv2d(96, 32, 3, padding=1), nn.ReLU(inplace=True))
         self.dec2 = nn.Conv2d(32, 1, 3, padding=1)
 
@@ -60,13 +60,14 @@ class SpectralConv2d(nn.Module):
 
 
 class FNO2d(nn.Module):
-    def __init__(self, modes1=20, modes2=10, width=64):
+    def __init__(self, modes1=20, modes2=10, width=64, output_size=(100,200)):
         super().__init__()
         self.fc0 = nn.Linear(1, width)
         self.convs = nn.ModuleList([SpectralConv2d(width, width, modes1, modes2) for _ in range(4)])
         self.ws = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(4)])
         self.fc1 = nn.Linear(width, 128)
         self.fc2 = nn.Linear(128, 1)
+        self.output_size = output_size
 
     def forward(self, x):
         # x: (B,1,20,20) -> 残差
@@ -74,7 +75,7 @@ class FNO2d(nn.Module):
         x = self.fc0(x).permute(0, 3, 1, 2)  # (B,width,H,W)
         for c, w in zip(self.convs, self.ws):
             x = torch.nn.functional.gelu(c(x) + w(x))
-        x = torch.nn.functional.interpolate(x, size=(100, 200), mode='bilinear', align_corners=False)
+        x = torch.nn.functional.interpolate(x, size=self.output_size, mode='bilinear', align_corners=False)
         x = x.permute(0, 2, 3, 1)  # (B,100,200,width)
         x = torch.nn.functional.gelu(self.fc1(x))
         x = self.fc2(x).permute(0, 3, 1, 2).float()  # (B,1,100,200)
