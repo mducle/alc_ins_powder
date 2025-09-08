@@ -124,7 +124,7 @@ class EDSR(nn.Module):
                 raise RuntimeError('scale factor must be between 2 and 10')
             scales = {2:[2], 3:[3], 4:[2,2], 5:[5], 6:[3,2], 7:[7], 8:[2,2,2], 9:[3,3], 10:[5,2]}
             self.upsampling = nn.Sequential(
-                *tuple([UpsampleBlock(64, n) for n in scales[scale_factor[0]]]),
+                *tuple([UpsampleBlock(64, n) for n in scales[int(scale_factor[0])]]),
                 nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1),
             )
     def forward(self, x):
@@ -157,14 +157,14 @@ class WDSR(nn.Module):
         super().__init__()
         if scale_factor[0] != scale_factor[1]:
             warnings.warn(f'x- and y- scale_factors not the same. Will use a less efficient algorithm')
-            upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False),
+            upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
         else:
-            upsample = nn.PixelShuffle(scale_factor[0]),
-        scalesq = scale_factor[0] * scale_factor[1]
+            upsample = nn.PixelShuffle(int(scale_factor[0]))
+        scalesq = int(scale_factor[0] * scale_factor[1])
         n_feats, n_resblocks, kernel_size = (64, 16, 3)  # Same parameters as EDSR
         self.net = nn.Sequential(
             nn.utils.parametrizations.weight_norm(nn.Conv2d(1, n_feats, 3, padding=1)),
-            *tuple([WBlock(n_feats, kernel_size, n_feats * max(scale_factor) if block_type == 'A' else None)] * n_resblocks),
+            *tuple([WBlock(n_feats, kernel_size, n_feats * int(max(scale_factor)) if block_type == 'A' else None)] * n_resblocks),
             nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats, scalesq, 3, padding=1)),
             upsample,
         )

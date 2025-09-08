@@ -399,15 +399,15 @@ def main():
     # ========== 模型 ==========
 
     if args.model == 'srcnn':
-        net = SRCNN(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
+        net = SRCNN(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     elif args.model == 'unet':
-        net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
+        net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     elif args.model == 'fno':
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
     elif args.model == 'edsr':
-        net = EDSR(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
+        net = EDSR(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     elif args.model == 'wdsr':
-        net = WDSR(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
+        net = WDSR(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
