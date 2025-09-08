@@ -130,3 +130,47 @@ class EDSR(nn.Module):
     def forward(self, x):
         out1 = self.conv1(x)
         return self.upsampling(torch.add(self.net(out1), out1)).float()
+
+
+# -------- WDSR ( https://arxiv.org/pdf/1808.08718.pdf ) --------
+class WBlock(nn.Module):
+    def __init__(self, n_feats, kernel_size, block_feats=None):
+        super().__init__()
+        if block_feats: # A-type residual blocks
+            self.net = nn.Sequential(
+                nn.parametrizations.weight_norm(nn.Conv2d(n_feats, block_feats, kernel_size, padding=kernel_size//2)),
+                nn.ReLU(inplace=True),
+                nn.parametrizations.weight_norm(nn.Conv2d(block_feats, n_feats, kernel_size, padding=kernel_size//2)),
+            )
+        else:           # B-type residual blocks
+            self.net = nn.Sequential(
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats, n_feats * 6, 1, padding=0)),
+                nn.ReLU(inplace=True),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats * 6, int(n_feats * 0.8), 1, padding=0)),
+                nn.utils.parametrizations.weight_norm(nn.Conv2d(int(n_feats * 0.8), n_feats, kernel_size, padding=kernel_size//2)),
+            )
+    def forward(self, x):
+        return self.net(x) + x
+
+class WDSR(nn.Module):
+    def __init__(self, scale_factor=(4,4), block_type='B'):
+        super().__init__()
+        if scale_factor[0] != scale_factor[1]:
+            warnings.warn(f'x- and y- scale_factors not the same. Will use a less efficient algorithm')
+            upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False),
+        else:
+            upsample = nn.PixelShuffle(scale_factor[0]),
+        scalesq = scale_factor[0] * scale_factor[1]
+        n_feats, n_resblocks, kernel_size = (64, 16, 3)  # Same parameters as EDSR
+        self.net = nn.Sequential(
+            nn.utils.parametrizations.weight_norm(nn.Conv2d(1, n_feats, 3, padding=1)),
+            *tuple([WBlock(n_feats, kernel_size, n_feats * max(scale_factor) if block_type == 'A' else None)] * n_resblocks),
+            nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats, scalesq, 3, padding=1)),
+            upsample,
+        )
+        self.skip = nn.Sequential(
+            nn.utils.parametrizations.weight_norm(nn.Conv2d(1, scalesq, 3, padding=1)),
+            upsample,
+        )
+    def forward(self, x):
+        return self.net(x) + self.skip(x)
