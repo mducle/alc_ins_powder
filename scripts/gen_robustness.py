@@ -19,6 +19,7 @@ from sklearn.model_selection import train_test_split
 from mp_api.client import MPRester
 
 import pymatgen.io.ase
+import ase
 
 from janus_core.calculations.phonons import Phonons
 
@@ -32,7 +33,9 @@ from euphonic import ureg
 
 # ---- 模型 ----
 
-from model2 import SRCNN, PowderUNet, FNO2d
+import sys, os
+sys.path.append(os.path.dirname(__file__))
+from model import SRCNN, PowderUNet, FNO2d
 
 # ============== 配置 ==============
 
@@ -42,6 +45,8 @@ MATPROJ_APIKEY = 'LvxElbvFT1ttFZLGiLgvtWPxN442GVdr'
 
 BLACKLIST = {"Ac", "Th", "Pa", "U", "Np", "Pu"}
 
+SEED = 1001
+import random
 
 # ---------- utils ----------
 
@@ -64,6 +69,11 @@ def sanitize(arr, clip_pct=99.9, nonneg=True):
     return a
 
 
+class myMPDoc():
+    def __init__(self, m_id, ele, ns):
+        self.material_id, self.elements, self.nsites = (m_id, ele, ns)
+
+
 def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
 
                  blacklist=BLACKLIST, oversample=10):
@@ -77,17 +87,21 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
 
     with MPRester(api_key=api_key) as mpr:
 
-        docs = mpr.materials.summary.search(
+        docs_fname = f'mpr_docs_nelem{num_elements}.npy'
+        if os.path.exists(docs_fname):
+            docs = np.load(docs_fname, allow_pickle=True)
+        else:
+            docs = mpr.materials.summary.search(
+                fields=["material_id", "elements", "nsites"],
+                num_elements=num_elements,
+                is_stable=True
+            )
+            np.save(docs_fname, [myMPDoc(d.material_id, d.elements, d.nsites) for d in docs])
 
-            fields=["material_id", "elements", "nsites"],
-
-            num_elements=num_elements,
-
-            is_stable=True
-
-        )
-
-        for d in docs:
+        random.seed(1001)
+        #for d in docs:
+        for idd in random.choices(range(len(docs)), k=hard_cap*2):
+            d = docs[idd]
 
             if d.nsites is not None and d.nsites > nsites_max:
                 continue
@@ -105,14 +119,31 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
     return ids
 
 
-def gen_single(mp_id, do_plot=False):
-    with MPRester(api_key=MATPROJ_APIKEY) as mp:
+def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_size=(100,200), npts=(200,1000)):
+    innpy = f'janus_results/{mp_id}-powder-{input_size[0]}x{input_size[1]}-np{npts[0]}.npy'
+    outnpy = f'janus_results/{mp_id}-powder-{output_size[0]}x{output_size[1]}-np{npts[1]}.npy'
+    has_in, has_out = (False, False)
+    if not no_load:
+        if os.path.exists(innpy):
+            z_coarse = np.load(innpy)
+            if z_coarse.shape == input_size:
+                has_in = True
+        if os.path.exists(outnpy):
+            z_high = np.load(outnpy)
+            if z_high.shape == output_size:
+                has_out = True
+        if has_in and has_out:
+            return z_coarse.flatten(), z_high.flatten()
 
-        struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
-
-            mp.get_structure_by_material_id(mp_id)
-
-        )
+    structnpy = f'janus_results/{mp_id}-struct.npy'
+    if os.path.exists(structnpy):
+        struct = ase.Atoms(np.load(structnpy, allow_pickle=True).tolist())
+    else:
+        with MPRester(api_key=MATPROJ_APIKEY) as mp:
+            struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
+                mp.get_structure_by_material_id(mp_id)
+            )
+        np.save(structnpy, struct)
 
     # 二次防护：如果有黑名单元素，直接跳过（避免后续 Debye-Waller 报错）
 
@@ -127,25 +158,18 @@ def gen_single(mp_id, do_plot=False):
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ph = Phonons(
+    if not os.path.exists(f'janus_results/{formula}-phonopy.yml') or not os.path.exists(f'janus_results/{formula}-force_constants.hdf5'):
+        ph = Phonons(
+            struct=struct.copy(), arch="mace_mp", device=device_str, model="small",
+            calc_kwargs={"default_dtype": "float64"},
+            supercell=[2, 2, 2], displacement=0.01, temp_step=2.0, temp_min=0.0, temp_max=2000.0,
+            minimize=True,
+            minimize_kwargs={"filter_kwargs": {"hydrostatic_strain": False}, "fmax": 0.1, "optimizer": "MDMin"},
+            force_consts_to_hdf5=True, plot_to_file=False, symmetrize=False, write_full=True, write_results=True,
+        )
+        ph.calc_force_constants()
 
-        struct=struct.copy(), arch="mace_mp", device=device_str, model="small",
-
-        calc_kwargs={"default_dtype": "float64"},
-
-        supercell=[2, 2, 2], displacement=0.01, temp_step=2.0, temp_min=0.0, temp_max=2000.0,
-
-        minimize=True,
-
-        minimize_kwargs={"filter_kwargs": {"hydrostatic_strain": False}, "fmax": 0.1, "optimizer": "MDMin"},
-
-        force_consts_to_hdf5=True, plot_to_file=False, symmetrize=False, write_full=True, write_results=True,
-
-    )
-
-    ph.calc_force_constants()
-
-    ph.calc_bands(write_bands=True)
+    #ph.calc_bands(write_bands=True)
 
     fc = euphonic.ForceConstants.from_phonopy(
 
@@ -161,49 +185,47 @@ def gen_single(mp_id, do_plot=False):
 
     # 高分辨率
 
-    qbins_h = np.linspace(0, 6, 101) * ureg('1 / angstrom')
+    qbins_h = np.linspace(0, 6, output_size[0]+1) * ureg('1 / angstrom')
 
     qc_h = (qbins_h[:-1] + qbins_h[1:]) / 2
 
-    ebins_h = np.linspace(0, 60, 201) * ureg('meV')
+    ebins_h = np.linspace(0, 60, output_size[1]+1) * ureg('meV')
 
-    z_high = np.empty((len(qc_h), len(ebins_h) - 1))
-
-    for i, q in enumerate(qc_h):
-        spec = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
-
-                                              sampling='golden', jitter=True,
-
-                                              energy_bins=ebins_h / 1.2)
-
-        z_high[i, :] = spec.y_data.magnitude
+    if not has_out:
+        z_high = np.empty((len(qc_h), len(ebins_h) - 1))
+        for i, q in enumerate(qc_h):
+            spec = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
+                                                  sampling='golden', npts=npts[1], jitter=True,
+                                                  energy_bins=ebins_h / 1.2)
+            z_high[i, :] = spec.y_data.magnitude
 
     # 粗分辨率
 
-    qbins_c = np.linspace(0, 6, 21) * ureg('1 / angstrom')
+    qbins_c = np.linspace(0, 6, input_size[0]+1) * ureg('1 / angstrom')
 
     qc_c = (qbins_c[:-1] + qbins_c[1:]) / 2
 
-    ebins_c = np.linspace(0, 60, 21) * ureg('meV')
+    ebins_c = np.linspace(0, 60, input_size[1]+1) * ureg('meV')
 
     z_coarse = np.empty((len(qc_c), len(ebins_c) - 1))
 
-    for i, q in enumerate(qc_c):
-        spec_c = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
-
-                                                sampling='golden', npts=200,
-
-                                                jitter=True, energy_bins=ebins_c / 1.2)
-
-        z_coarse[i, :] = spec_c.y_data.magnitude
+    if not has_in:
+        for i, q in enumerate(qc_c):
+            spec_c = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
+                                                    sampling='golden', npts=npts[0],
+                                                    jitter=True, energy_bins=ebins_c / 1.2)
+            z_coarse[i, :] = spec_c.y_data.magnitude
 
     if not (np.all(np.isfinite(z_coarse)) and np.all(np.isfinite(z_high))):
         raise ValueError("non-finite values in z_coarse/z_high")
+    if not no_load:
+        if not has_out: np.save(outnpy, z_high)
+        if not has_in: np.save(innpy, z_coarse)
 
     return z_coarse.flatten(), z_high.flatten()
 
 
-def collect_samples(mp_ids, need_n=None):
+def collect_samples(mp_ids, need_n=None, input_size=(20,20), output_size=(100,200), npts=(200,1000)):
     """按需收集样本：凑够 need_n 个成功样本就停止；失败样本记录但不终止整轮。"""
 
     need_n = need_n or len(mp_ids)
@@ -217,7 +239,7 @@ def collect_samples(mp_ids, need_n=None):
 
         try:
 
-            inp, tgt = gen_single(mpid, do_plot=False)
+            inp, tgt = gen_single(mpid, do_plot=False, input_size=input_size, output_size=output_size, npts=npts)
 
             if not (np.all(np.isfinite(inp)) and np.all(np.isfinite(tgt))):
                 raise ValueError("non-finite values in sample")
@@ -313,9 +335,15 @@ def main():
 
     parser.add_argument('--limit', type=int, default=60)
 
-    parser.add_argument('--speed-mpid', type=str, default=None)
+    parser.add_argument('--speed-mpid', type=str, default='mp-8566')
+    parser.add_argument('--input-size', type=str, default='20x20')
+    parser.add_argument('--output-size', type=str, default='100x200')
+    parser.add_argument('--npts', type=str, default='200-1000')
 
     args = parser.parse_args()
+    in_sz = tuple(int(v) for v in args.input_size.split('x'))
+    out_sz = tuple(int(v) for v in args.output_size.split('x'))
+    npts = tuple(int(v) for v in args.npts.split('-'))
 
     # ========== 采集数据 ==========
 
@@ -328,7 +356,7 @@ def main():
     if not mp_ids:
         raise RuntimeError("No candidate mp_ids fetched. Check API key/filters.")
 
-    inputs, targets, ok_ids, errors = collect_samples(mp_ids, need_n=args.limit)
+    inputs, targets, ok_ids, errors = collect_samples(mp_ids, need_n=args.limit, input_size=in_sz, output_size=out_sz, npts=npts)
 
     if len(inputs) < 1:
 
@@ -350,9 +378,9 @@ def main():
 
     sx, sy = MinMaxScaler(), MinMaxScaler()
 
-    Xs = sx.fit_transform(X).reshape(-1, 1, 20, 20)
+    Xs = sx.fit_transform(X).reshape(-1, 1, in_sz[0], in_sz[1])
 
-    Ys = sy.fit_transform(Y).reshape(-1, 1, 100, 200)
+    Ys = sy.fit_transform(Y).reshape(-1, 1, out_sz[0], out_sz[1])
 
     X_tr, X_val, y_tr, y_val = train_test_split(Xs, Ys, test_size=0.2, random_state=0)
 
@@ -372,15 +400,15 @@ def main():
 
     if args.model == 'srcnn':
 
-        net = SRCNN()
+        net = SRCNN(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
 
     elif args.model == 'unet':
 
-        net = PowderUNet()
+        net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
 
     else:
 
-        net = FNO2d(modes1=20, modes2=10, width=64)
+        net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -394,7 +422,7 @@ def main():
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5, verbose=True)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)#, verbose=True)
 
     # ========== 训练 ==========
 
@@ -415,7 +443,7 @@ def main():
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
 
-            base = nn.functional.interpolate(xb, size=(100, 200), mode='bilinear', align_corners=False)
+            base = nn.functional.interpolate(xb, size=out_sz, mode='bilinear', align_corners=False)
 
             res = net(xb)
 
@@ -464,7 +492,7 @@ def main():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
 
-                base = nn.functional.interpolate(xb, size=(100, 200), mode='bilinear', align_corners=False)
+                base = nn.functional.interpolate(xb, size=out_sz, mode='bilinear', align_corners=False)
 
                 pred = (base + net(xb)).clamp(0.0, 1.0)
 
@@ -569,7 +597,7 @@ def main():
 
     t0 = time.time()
 
-    zc_vec, zh_vec = gen_single(speed_mpid, do_plot=False)
+    zc_vec, zh_vec = gen_single(speed_mpid, do_plot=False, no_load=True, input_size=in_sz, output_size=out_sz, npts=npts)
 
     t_brute = time.time() - t0
 
@@ -579,13 +607,13 @@ def main():
 
     zc_scaled = (zc - sx.data_min_) / (sx.data_max_ - sx.data_min_ + 1e-12)
 
-    x = torch.from_numpy(zc_scaled.reshape(1, 1, 20, 20)).float().to(device)
+    x = torch.from_numpy(zc_scaled.reshape(1, 1, in_sz[0], in_sz[1])).float().to(device)
 
     with torch.no_grad():
 
         t1 = time.time()
 
-        base = nn.functional.interpolate(x, size=(100, 200), mode='bilinear', align_corners=False)
+        base = nn.functional.interpolate(x, size=out_sz, mode='bilinear', align_corners=False)
 
         res = net(x)
 
@@ -606,9 +634,9 @@ def main():
 
     y_log = inverse_scale(y_scaled_np, sy)
 
-    y_pred = np.expm1(y_log).reshape(100, 200)
+    y_pred = np.expm1(y_log).reshape(*out_sz)
 
-    y_true = zh_vec.reshape(100, 200)
+    y_true = zh_vec.reshape(*out_sz)
 
     vmin = 0.0
 
