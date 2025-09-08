@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.fft as fft
-
+import warnings
 
 # -------- SRCNN（输出残差） --------
 class SRCNN(nn.Module):
@@ -80,3 +80,53 @@ class FNO2d(nn.Module):
         x = torch.nn.functional.gelu(self.fc1(x))
         x = self.fc2(x).permute(0, 3, 1, 2).float()  # (B,1,100,200)
         return x  # 残差
+
+# -------- EDSR ( https://arxiv.org/pdf/1707.02921.pdf ) --------
+# Based on: https://github.com/Lornatang/EDSR-PyTorch/
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.rcb = nn.Sequential(
+            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.add(torch.mul(self.rcb(x), 0.1), x)
+
+
+class UpsampleBlock(nn.Module):
+    def __init__(self, channels, upscale_factor):
+        super().__init__()
+        self.upsample_block = nn.Sequential(
+            nn.Conv2d(in_channels=channels, out_channels=channels * upscale_factor**2, kernel_size=3, padding=1),
+            nn.PixelShuffle(upscale_factor),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.upsample_block(x)
+
+
+class EDSR(nn.Module):
+    def __init__(self, scale_factor=(4,4)):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=64, kernel_size=3, padding=1)
+        self.net = nn.Sequential(
+            *tuple([ResidualConvBlock(64)]*16),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
+        )
+        if scale_factor[0] != scale_factor[1]:
+            warnings.warn(f'x- and y- scale_factors not the same. Will use a less efficient algorithm')
+            self.upsampling = nn.Sequential(
+                nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False),
+                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1))
+        else: # Use PixelShuffle like in original implementation
+            if scale_factor[0] > 10 or scale_factor[0] < 2:
+                raise RuntimeError('scale factor must be between 2 and 10')
+            scales = {2:[2], 3:[3], 4:[2,2], 5:[5], 6:[3,2], 7:[7], 8:[2,2,2], 9:[3,3], 10:[5,2]}
+            self.upsampling = nn.Sequential(
+                *tuple([UpsampleBlock(64, n) for n in scales[scale_factor[0]]]),
+                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1),
+            )
+    def forward(self, x):
+        out1 = self.conv1(x)
+        return self.upsampling(torch.add(self.net(out1), out1)).float()
