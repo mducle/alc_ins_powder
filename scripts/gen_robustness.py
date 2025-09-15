@@ -35,7 +35,7 @@ from euphonic import ureg
 
 import sys, os
 sys.path.append(os.path.dirname(__file__))
-from model import SRCNN, PowderUNet, FNO2d
+from model import SRCNN, PowderUNet, FNO2d, EDSR, WDSR
 
 # ============== 配置 ==============
 
@@ -325,7 +325,7 @@ def inverse_scale(arr, scaler):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--model', choices=['srcnn', 'unet', 'fno'], required=True)
+    parser.add_argument('--model', choices=['srcnn', 'unet', 'fno', 'edsr', 'wdsr'], required=True)
 
     parser.add_argument('--epochs', type=int, default=80)
 
@@ -399,16 +399,15 @@ def main():
     # ========== 模型 ==========
 
     if args.model == 'srcnn':
-
-        net = SRCNN(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
-
+        net = SRCNN(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     elif args.model == 'unet':
-
-        net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/out_sz[1]))
-
-    else:
-
+        net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
+    elif args.model == 'fno':
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
+    elif args.model == 'edsr':
+        net = EDSR(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
+    elif args.model == 'wdsr':
+        net = WDSR(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
