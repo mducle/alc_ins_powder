@@ -20,11 +20,8 @@ from euphonic import ureg
 
 # ---- model ----
 import sys
-
-from wfdn_fno import Hybrid_WFDN_FNO
-
 sys.path.append(os.path.dirname(__file__))
-from model3 import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO
+from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO
 
 # ============== Config ==============
 MATPROJ_APIKEY = 'LvxElbvFT1ttFZLGiLgvtWPxN442GVdr'
@@ -302,6 +299,8 @@ def main():
                     'sx_max': torch.tensor(sx.data_max_.copy(), dtype=torch.float64, device='cpu'),
                     'sy_min': torch.tensor(sy.data_min_.copy(), dtype=torch.float64, device='cpu'),
                     'sy_max': torch.tensor(sy.data_max_.copy(), dtype=torch.float64, device='cpu'),
+                    'sy_scale': torch.tensor(sy.scale_.copy(), dtype=torch.float64, device='cpu'),
+                    'sy_offset': torch.tensor(sy.min_.copy(), dtype=torch.float64, device='cpu'),
                     'in_sz': in_sz,
                     'out_sz': out_sz
                 }, f'checkpoints/{args.model}.pt')
