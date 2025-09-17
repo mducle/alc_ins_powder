@@ -1,13 +1,51 @@
+# model.py
 import torch
 import torch.nn as nn
 import torch.fft as fft
-import warnings
+from typing import Tuple
 
-# -------- SRCNN（输出残差） --------
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def make_coord_grid(B: int, H: int, W: int, device=None, dtype=torch.float32):
+    """
+    Normalized (Q,E) coords in [-1,1], shape (B, 2, H, W)
+    channel 0 -> Q axis (vertical); channel 1 -> E axis (horizontal)
+    """
+    q = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+    e = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+    qq, ee = torch.meshgrid(q, e, indexing='ij')
+    grid = torch.stack([qq, ee], dim=0).unsqueeze(0).repeat(B, 1, 1, 1)  # (B,2,H,W)
+    return grid
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, nf=64, kernel_size=3):
+        super().__init__()
+        pad = kernel_size // 2
+        self.body = nn.Sequential(
+            nn.Conv2d(nf, nf, kernel_size, padding=pad),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(nf, nf, kernel_size, padding=pad)
+        )
+
+    def forward(self, x):
+        return x + self.body(x)
+
+
+# ----------------------------
+# 1) SRCNN (residual on HR)
+# ----------------------------
 class SRCNN(nn.Module):
-    def __init__(self, scale_factor=(5, 10)):
+    """
+    Classic SRCNN-style model that predicts HR residual given LR input.
+    It first upsamples LR -> HR, then applies SRCNN and outputs residual.
+    """
+    def __init__(self, scale_factor: Tuple[float, float]=(5, 10)):
         super().__init__()
         self.pre = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
+        # operate at HR
         self.net = nn.Sequential(
             nn.Conv2d(1, 64, 9, padding=4), nn.ReLU(inplace=True),
             nn.Conv2d(64, 32, 1), nn.ReLU(inplace=True),
@@ -15,30 +53,179 @@ class SRCNN(nn.Module):
         )
 
     def forward(self, x):
-        up = self.pre(x)
-        return self.net(up).float()  # 残差
+        # x: (B,1,Hl,Wl) -> upsample to HR
+        up = self.pre(x)            # (B,1,Hh,Wh)
+        res = self.net(up).float()  # residual on HR
+        return res
 
 
-# -------- U-Net（输出残差） --------
+# ----------------------------
+# 2) "PowderUNet" implemented as EDSR-like SR model
+# ----------------------------
 class PowderUNet(nn.Module):
-    def __init__(self, scale_factor=(5, 10)):
+    """
+    EDSR-style residual super-resolution network (kept class name for compatibility).
+    - LR input -> bicubic upsample to HR inside the network
+    - concat normalized (Q,E) coordinate channels at HR
+    - a shallow head + N residual blocks + tail conv -> 1-channel residual
+    """
+    def __init__(self, scale_factor=(5, 10), nf=64, n_blocks=16, kq=3, ke=3):
         super().__init__()
-        self.enc1 = nn.Sequential(nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(inplace=True))
-        self.enc2 = nn.Sequential(nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True))
-        self.up = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
-        self.dec1 = nn.Sequential(nn.Conv2d(96, 32, 3, padding=1), nn.ReLU(inplace=True))
-        self.dec2 = nn.Conv2d(32, 1, 3, padding=1)
+        self.scale_factor = scale_factor
+
+        # head after upsampling (+coords)
+        # We'll have 1 (intensity) + 2 (coords) = 3 input channels at HR
+        self.head = nn.Sequential(
+            nn.Conv2d(3, nf, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+
+        # body
+        self.body = nn.Sequential(*[ResidualBlock(nf=nf, kernel_size=3) for _ in range(n_blocks)])
+
+        # tail
+        self.tail = nn.Conv2d(nf, 1, kernel_size=3, padding=1)
+
+        # internal upsampler
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bicubic', align_corners=False)
 
     def forward(self, x):
-        x1 = self.enc1(x)
-        x2 = self.enc2(x1)
-        u = self.up(x2)
-        x1u = nn.functional.interpolate(x1, size=u.shape[-2:], mode='bilinear', align_corners=False)
-        out = self.dec2(self.dec1(torch.cat([u, x1u], dim=1)))
-        return out.float()  # 残差
+        """
+        x: (B,1,Hl,Wl) -> upsample -> concat coords -> residual blocks -> residual HR
+        """
+        B, C, Hl, Wl = x.shape
+        up = self.upsample(x)  # (B,1,Hh,Wh)
+        Hh, Wh = up.shape[-2], up.shape[-1]
+
+        # coords
+        coords = make_coord_grid(B, Hh, Wh, device=up.device, dtype=up.dtype)  # (B,2,Hh,Wh)
+        inp = torch.cat([up, coords], dim=1)  # (B,3,Hh,Wh)
+
+        feat = self.head(inp)
+        feat = self.body(feat)
+        res  = self.tail(feat).float()
+        return res  # residual on HR
 
 
-# -------- FNO2d（输出残差） --------
+# ----------------------------
+# 3) FNO2d: Fourier Neural Operator on HR grid (residual)
+# ----------------------------
+class SpectralConv2d(nn.Module):
+    """
+    2D spectral convolution layer (FNO). Expects input (B,C,H,W) on HR grid.
+    Uses parameterized complex weights on low-frequency modes and keeps the rest zero.
+    """
+    def __init__(self, in_c, out_c, m1, m2):
+        super().__init__()
+        # store real+imag separately in last dim=2, then view_as_complex
+        self.weights = nn.Parameter(torch.randn(in_c, out_c, m1, m2, 2) * (1 / (in_c * out_c)))
+        self.m1, self.m2 = m1, m2
+
+    def forward(self, x):
+        # x: (B,in_c,H,W), real
+        B, C, H, W = x.shape
+        x_ft = fft.rfftn(x, dim=(2, 3), norm="ortho")  # complex: (B,in_c,H,W//2+1)
+        Hf, Wf = x_ft.shape[2], x_ft.shape[3]
+        m1, m2 = min(self.m1, Hf), min(self.m2, Wf)
+
+        out_ft = torch.zeros((B, self.weights.shape[1], H, Wf), device=x.device, dtype=torch.cfloat)
+        w = torch.view_as_complex(self.weights)  # (in_c,out_c,self.m1,self.m2)
+        x_slice = x_ft[:, :, :m1, :m2]          # (B,in_c,m1,m2)
+        w_slice = w[:, :, :m1, :m2]             # (in_c,out_c,m1,m2)
+        # contract in_c
+        out_ft[:, :, :m1, :m2] = torch.einsum("bixy,ioxy->boxy", x_slice, w_slice)
+        out = fft.irfftn(out_ft, s=(H, W), dim=(2, 3), norm="ortho").real
+        return out
+
+
+class FNO2d(nn.Module):
+    """
+    FNO-based residual super-resolution head:
+    - LR input -> bicubic upsample to HR
+    - concat (Q,E) coords -> 1x1 conv to width channels
+    - several spectral conv blocks with skip 1x1
+    - 1x1 -> 1 residual channel
+    """
+    def __init__(self, modes1=20, modes2=10, width=64, output_size: Tuple[int,int]=(100,200), n_layers=4):
+        super().__init__()
+        self.output_size = output_size
+        self.n_layers = n_layers
+        self.modes1, self.modes2 = modes1, modes2
+
+        # embed 3 channels (intensity+coords) -> width
+        self.embed = nn.Conv2d(3, width, kernel_size=1)
+
+        # spectral conv blocks
+        self.convs = nn.ModuleList([SpectralConv2d(width, width, modes1, modes2) for _ in range(n_layers)])
+        self.ws    = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(n_layers)])
+
+        # head/tail MLP on pixels (1x1 conv acts like per-pixel linear)
+        self.head = nn.Conv2d(width, width, 1)
+        self.tail = nn.Conv2d(width, 1, 1)
+
+        # upsampler (LR->HR)
+        self.upsample = nn.Upsample(size=output_size, mode='bicubic', align_corners=False)
+
+    def forward(self, x):
+        """
+        x: (B,1,Hl,Wl) -> HR -> add coords -> spectral blocks -> residual (B,1,Hh,Wh)
+        """
+        B, C, Hl, Wl = x.shape
+        up = self.upsample(x)  # (B,1,Hh,Wh)
+        Hh, Wh = up.shape[-2], up.shape[-1]
+
+        coords = make_coord_grid(B, Hh, Wh, device=up.device, dtype=up.dtype)  # (B,2,Hh,Wh)
+        h = torch.cat([up, coords], dim=1)  # (B,3,Hh,Wh)
+        h = self.embed(h)
+
+        for sc, w1 in zip(self.convs, self.ws):
+            h = torch.nn.functional.gelu(sc(h) + w1(h))
+
+        h = torch.nn.functional.gelu(self.head(h))
+        res = self.tail(h).float()
+        return res
+
+
+import torch
+import torch.nn as nn
+import torch.fft as fft
+import torch.nn.functional as F
+
+
+# -------- Wide Activation Distillation Block (WFDN) --------
+class WFDNBlock(nn.Module):
+    def __init__(self, in_channels=64, distill_rate=0.25, expansion=4):
+        super().__init__()
+        distilled_channels = int(in_channels * distill_rate)
+        remaining_channels = in_channels - distilled_channels
+
+        # 1x1 Conv 扩展通道
+        self.conv1 = nn.Conv2d(in_channels, in_channels * expansion, 1)
+        self.relu = nn.ReLU(inplace=True)
+        # 3x3 Conv 压缩回去
+        self.conv2 = nn.Conv2d(in_channels * expansion, in_channels, 3, padding=1)
+
+        # 蒸馏与残差分支
+        self.distilled = nn.Conv2d(in_channels, distilled_channels, 1)
+        self.remaining = nn.Conv2d(in_channels, remaining_channels, 3, padding=1)
+
+        # 融合
+        self.fuse = nn.Conv2d(distilled_channels + remaining_channels, in_channels, 1)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        d = self.distilled(out)
+        r = self.remaining(out)
+        out = torch.cat([d, r], dim=1)
+        out = self.fuse(out)
+
+        return out + x  # 残差连接
+
+
+# -------- FNO2d --------
 class SpectralConv2d(nn.Module):
     def __init__(self, in_c, out_c, m1, m2):
         super().__init__()
@@ -46,131 +233,60 @@ class SpectralConv2d(nn.Module):
         self.m1, self.m2 = m1, m2
 
     def forward(self, x):
-        # x: (B,in_c,H,W)
         B, C, H, W = x.shape
-        x_ft = fft.rfftn(x, dim=(2, 3), norm="ortho")  # (B,in_c,H,W//2+1)
+        x_ft = fft.rfftn(x, dim=(2, 3), norm="ortho")
         Hf, Wf = x_ft.shape[2], x_ft.shape[3]
         m1, m2 = min(self.m1, Hf), min(self.m2, Wf)
         out_ft = torch.zeros((B, self.weights.shape[1], H, Wf), device=x.device, dtype=torch.cfloat)
-        w = torch.view_as_complex(self.weights)  # (in_c,out_c,self.m1,self.m2)
-        x_slice = x_ft[:, :, :m1, :m2]  # (B,in_c,m1,m2)
-        w_slice = w[:, :, :m1, :m2]  # (in_c,out_c,m1,m2)
+        w = torch.view_as_complex(self.weights)
+        x_slice = x_ft[:, :, :m1, :m2]
+        w_slice = w[:, :, :m1, :m2]
         out_ft[:, :, :m1, :m2] = torch.einsum("bixy,ioxy->boxy", x_slice, w_slice)
         return fft.irfftn(out_ft, s=(H, W), dim=(2, 3), norm="ortho")
 
 
-class FNO2d(nn.Module):
-    def __init__(self, modes1=20, modes2=10, width=64, output_size=(100,200)):
+class FNO2dBlock(nn.Module):
+    def __init__(self, in_c=64, modes1=20, modes2=10):
         super().__init__()
-        self.fc0 = nn.Linear(1, width)
-        self.convs = nn.ModuleList([SpectralConv2d(width, width, modes1, modes2) for _ in range(4)])
-        self.ws = nn.ModuleList([nn.Conv2d(width, width, 1) for _ in range(4)])
-        self.fc1 = nn.Linear(width, 128)
-        self.fc2 = nn.Linear(128, 1)
+        self.spectral_conv = SpectralConv2d(in_c, in_c, modes1, modes2)
+        self.w = nn.Conv2d(in_c, in_c, 1)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.spectral_conv(x) + self.w(x))
+
+
+# -------- Hybrid Model: WFDN + FNO --------
+class Hybrid_WFDN_FNO(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64,
+                 num_wfdn=4, num_fno=2, output_size=(100, 200)):
+        super().__init__()
+        self.head = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+
+        # 局部分支：多层 WFDN Block
+        self.local_branch = nn.Sequential(*[WFDNBlock(base_channels) for _ in range(num_wfdn)])
+
+        # 全局分支：多层 FNO Block
+        self.global_branch = nn.Sequential(*[FNO2dBlock(base_channels) for _ in range(num_fno)])
+
+        # 融合
+        self.fuse = nn.Conv2d(base_channels * 2, base_channels, 1)
+        self.tail = nn.Conv2d(base_channels, 1, 3, padding=1)
+
         self.output_size = output_size
 
     def forward(self, x):
-        # x: (B,1,20,20) -> 残差
-        x = x.permute(0, 2, 3, 1)  # (B,H,W,1)
-        x = self.fc0(x).permute(0, 3, 1, 2)  # (B,width,H,W)
-        for c, w in zip(self.convs, self.ws):
-            x = torch.nn.functional.gelu(c(x) + w(x))
-        x = torch.nn.functional.interpolate(x, size=self.output_size, mode='bilinear', align_corners=False)
-        x = x.permute(0, 2, 3, 1)  # (B,100,200,width)
-        x = torch.nn.functional.gelu(self.fc1(x))
-        x = self.fc2(x).permute(0, 3, 1, 2).float()  # (B,1,100,200)
-        return x  # 残差
+        # x: (B,1,H,W)
+        feat = self.head(x)
 
-# -------- EDSR ( https://arxiv.org/pdf/1707.02921.pdf ) --------
-# Based on: https://github.com/Lornatang/EDSR-PyTorch/
-class ResidualConvBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.rcb = nn.Sequential(
-            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1),
-        )
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.add(torch.mul(self.rcb(x), 0.1), x)
+        local_feat = self.local_branch(feat)
+        global_feat = self.global_branch(feat)
 
+        fused = torch.cat([local_feat, global_feat], dim=1)
+        fused = self.fuse(fused)
+        fused = self.tail(fused)
 
-class UpsampleBlock(nn.Module):
-    def __init__(self, channels, upscale_factor):
-        super().__init__()
-        self.upsample_block = nn.Sequential(
-            nn.Conv2d(in_channels=channels, out_channels=channels * upscale_factor**2, kernel_size=3, padding=1),
-            nn.PixelShuffle(upscale_factor),
-        )
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.upsample_block(x)
-
-
-class EDSR(nn.Module):
-    def __init__(self, scale_factor=(4,4)):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=64, kernel_size=3, padding=1)
-        self.net = nn.Sequential(
-            *tuple([ResidualConvBlock(64)]*16),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
-        )
-        if scale_factor[0] != scale_factor[1]:
-            warnings.warn(f'x- and y- scale_factors not the same. Will use a less efficient algorithm')
-            self.upsampling = nn.Sequential(
-                nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False),
-                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1))
-        else: # Use PixelShuffle like in original implementation
-            if scale_factor[0] > 10 or scale_factor[0] < 2:
-                raise RuntimeError('scale factor must be between 2 and 10')
-            scales = {2:[2], 3:[3], 4:[2,2], 5:[5], 6:[3,2], 7:[7], 8:[2,2,2], 9:[3,3], 10:[5,2]}
-            self.upsampling = nn.Sequential(
-                *tuple([UpsampleBlock(64, n) for n in scales[int(scale_factor[0])]]),
-                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1),
-            )
-    def forward(self, x):
-        out1 = self.conv1(x)
-        return self.upsampling(torch.add(self.net(out1), out1)).float()
-
-
-# -------- WDSR ( https://arxiv.org/pdf/1808.08718.pdf ) --------
-class WBlock(nn.Module):
-    def __init__(self, n_feats, kernel_size, block_feats=None):
-        super().__init__()
-        if block_feats: # A-type residual blocks
-            self.net = nn.Sequential(
-                nn.parametrizations.weight_norm(nn.Conv2d(n_feats, block_feats, kernel_size, padding=kernel_size//2)),
-                nn.ReLU(inplace=True),
-                nn.parametrizations.weight_norm(nn.Conv2d(block_feats, n_feats, kernel_size, padding=kernel_size//2)),
-            )
-        else:           # B-type residual blocks
-            self.net = nn.Sequential(
-                nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats, n_feats * 6, 1, padding=0)),
-                nn.ReLU(inplace=True),
-                nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats * 6, int(n_feats * 0.8), 1, padding=0)),
-                nn.utils.parametrizations.weight_norm(nn.Conv2d(int(n_feats * 0.8), n_feats, kernel_size, padding=kernel_size//2)),
-            )
-    def forward(self, x):
-        return self.net(x) + x
-
-class WDSR(nn.Module):
-    def __init__(self, scale_factor=(4,4), block_type='B'):
-        super().__init__()
-        if scale_factor[0] != scale_factor[1]:
-            warnings.warn(f'x- and y- scale_factors not the same. Will use a less efficient algorithm')
-            upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
-        else:
-            upsample = nn.PixelShuffle(int(scale_factor[0]))
-        scalesq = int(scale_factor[0] * scale_factor[1])
-        n_feats, n_resblocks, kernel_size = (64, 16, 3)  # Same parameters as EDSR
-        self.net = nn.Sequential(
-            nn.utils.parametrizations.weight_norm(nn.Conv2d(1, n_feats, 3, padding=1)),
-            *tuple([WBlock(n_feats, kernel_size, n_feats * int(max(scale_factor)) if block_type == 'A' else None)] * n_resblocks),
-            nn.utils.parametrizations.weight_norm(nn.Conv2d(n_feats, scalesq, 3, padding=1)),
-            upsample,
-        )
-        self.skip = nn.Sequential(
-            nn.utils.parametrizations.weight_norm(nn.Conv2d(1, scalesq, 3, padding=1)),
-            upsample,
-        )
-    def forward(self, x):
-        return self.net(x) + self.skip(x)
+        # 上采样到目标尺寸
+        out = F.interpolate(fused, size=self.output_size,
+                            mode="bilinear", align_corners=False)
+        return out.float()  # 残差
