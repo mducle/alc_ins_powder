@@ -31,6 +31,7 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.man
 
 # ---------- utils ----------
 def sanitize(arr, clip_pct=99.9, nonneg=True):
+    """Clip outliers and ensure non-negative values"""
     a = np.asarray(arr, dtype=np.float64)
     finite = np.isfinite(a)
     if not finite.all():
@@ -47,7 +48,7 @@ class myMPDoc():
         self.material_id, self.elements, self.nsites = (m_id, ele, ns)
 
 def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
-                 blacklist=BLACKLIST, oversample=10):
+                 blacklist=BLACKLIST, oversample=10, seed=SEED):
     ids = []
     bl = {str(x) for x in blacklist}
     hard_cap = limit * max(1, int(oversample))
@@ -62,7 +63,7 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
                 is_stable=True
             )
             np.save(docs_fname, [myMPDoc(d.material_id, d.elements, d.nsites) for d in docs])
-        random.seed(SEED)
+        random.seed(seed)
         for idd in random.choices(range(len(docs)), k=hard_cap*2):
             d = docs[idd]
             if d.nsites is not None and d.nsites > nsites_max:
@@ -74,6 +75,30 @@ def fetch_mp_ids(api_key, limit=80, num_elements=(1, 3), nsites_max=20,
             if len(ids) >= hard_cap:
                 break
     return ids
+
+def gen_spec(output_size, npts, fc, dw, tt):
+    qbins_h = np.linspace(0, 6, output_size[0]+1) * ureg('1 / angstrom')
+    qc_h = (qbins_h[:-1] + qbins_h[1:]) / 2
+    ebins_h = np.linspace(0, 60, output_size[1]+1) * ureg('meV')
+    z_high = np.empty((len(qc_h), len(ebins_h) - 1))
+    for i, q in enumerate(qc_h):
+        spec = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
+                                              sampling='golden', npts=npts, jitter=True,
+                                              energy_bins=ebins_h / 1.2)
+        z_high[i, :] = spec.y_data.magnitude
+    return z_high
+
+def get_struct(mp_id):
+    structnpy = f'janus_results/{mp_id}-struct.npy'
+    if os.path.exists(structnpy):
+        struct = ase.Atoms(np.load(structnpy, allow_pickle=True).tolist())
+    else:
+        with MPRester(api_key=MATPROJ_APIKEY) as mp:
+            struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
+                mp.get_structure_by_material_id(mp_id)
+            )
+        np.save(structnpy, struct)
+    return struct
 
 def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_size=(100,200), npts=(200,1000)):
     innpy = f'janus_results/{mp_id}-powder-{input_size[0]}x{input_size[1]}-np{npts[0]}.npy'
@@ -91,15 +116,7 @@ def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_s
         if has_in and has_out:
             return z_coarse.flatten(), z_high.flatten()
 
-    structnpy = f'janus_results/{mp_id}-struct.npy'
-    if os.path.exists(structnpy):
-        struct = ase.Atoms(np.load(structnpy, allow_pickle=True).tolist())
-    else:
-        with MPRester(api_key=MATPROJ_APIKEY) as mp:
-            struct = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(
-                mp.get_structure_by_material_id(mp_id)
-            )
-        np.save(structnpy, struct)
+    struct = get_struct(mp_id)
 
     elems = {a.symbol for a in struct}
     if elems & BLACKLIST:
@@ -127,28 +144,10 @@ def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_s
     tt = 5 * ureg('K')
     dw = _get_debye_waller(tt, fc)
 
-    qbins_h = np.linspace(0, 6, output_size[0]+1) * ureg('1 / angstrom')
-    qc_h = (qbins_h[:-1] + qbins_h[1:]) / 2
-    ebins_h = np.linspace(0, 60, output_size[1]+1) * ureg('meV')
-
     if not has_out:
-        z_high = np.empty((len(qc_h), len(ebins_h) - 1))
-        for i, q in enumerate(qc_h):
-            spec = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
-                                                  sampling='golden', npts=npts[1], jitter=True,
-                                                  energy_bins=ebins_h / 1.2)
-            z_high[i, :] = spec.y_data.magnitude
-
-    qbins_c = np.linspace(0, 6, input_size[0]+1) * ureg('1 / angstrom')
-    qc_c = (qbins_c[:-1] + qbins_c[1:]) / 2
-    ebins_c = np.linspace(0, 60, input_size[1]+1) * ureg('meV')
-    z_coarse = np.empty((len(qc_c), len(ebins_c) - 1))
+        z_high = gen_spec(output_size, npts[1], fc, dw, tt)
     if not has_in:
-        for i, q in enumerate(qc_c):
-            spec_c = sample_sphere_structure_factor(fc, q, dw=dw, temperature=tt,
-                                                    sampling='golden', npts=npts[0],
-                                                    jitter=True, energy_bins=ebins_c / 1.2)
-            z_coarse[i, :] = spec_c.y_data.magnitude
+        z_coarse = gen_spec(input_size, npts[0], fc, dw, tt)
 
     if not (np.all(np.isfinite(z_coarse)) and np.all(np.isfinite(z_high))):
         raise ValueError("non-finite values in z_coarse/z_high")
@@ -302,7 +301,8 @@ def main():
                     'sy_scale': torch.tensor(sy.scale_.copy(), dtype=torch.float64, device='cpu'),
                     'sy_offset': torch.tensor(sy.min_.copy(), dtype=torch.float64, device='cpu'),
                     'in_sz': in_sz,
-                    'out_sz': out_sz
+                    'out_sz': out_sz,
+                    'npts': npts 
                 }, f'checkpoints/{args.model}.pt')
 
 if __name__ == '__main__':
