@@ -21,7 +21,7 @@ from euphonic import ureg
 # ---- model ----
 import sys
 sys.path.append(os.path.dirname(__file__))
-from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO
+from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO, Hybrid_GhostWFDN_FNO
 
 # ============== Config ==============
 MATPROJ_APIKEY = 'LvxElbvFT1ttFZLGiLgvtWPxN442GVdr'
@@ -204,7 +204,7 @@ def combined_loss(pred_hr, gt_hr, w_pix=1.0, w_grad=0.2, w_fft=0.1, q_axis_last=
 # ---- Train main ----
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', choices=['srcnn', 'unet', 'fno', 'wfdn_fno'], required=True)
+    parser.add_argument('--model', choices=['srcnn', 'unet', 'fno', 'wfdn_fno', 'ghost'], required=True)
     parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -244,6 +244,8 @@ def main():
         net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     elif args.model == 'wfdn_fno':
         net = Hybrid_WFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
+    elif args.model == 'ghost':
+        net = Hybrid_GhostWFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
     else:
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

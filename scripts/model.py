@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.fft as fft
 from typing import Tuple
+import torch.nn.functional as F
+
 
 # ----------------------------
 # Utilities
@@ -186,12 +188,6 @@ class FNO2d(nn.Module):
         return res
 
 
-import torch
-import torch.nn as nn
-import torch.fft as fft
-import torch.nn.functional as F
-
-
 # -------- Wide Activation Distillation Block (WFDN) --------
 class WFDNBlock(nn.Module):
     def __init__(self, in_channels=64, distill_rate=0.25, expansion=4):
@@ -226,25 +222,6 @@ class WFDNBlock(nn.Module):
 
 
 # -------- FNO2d --------
-class SpectralConv2d(nn.Module):
-    def __init__(self, in_c, out_c, m1, m2):
-        super().__init__()
-        self.weights = nn.Parameter(torch.randn(in_c, out_c, m1, m2, 2) * (1 / (in_c * out_c)))
-        self.m1, self.m2 = m1, m2
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x_ft = fft.rfftn(x, dim=(2, 3), norm="ortho")
-        Hf, Wf = x_ft.shape[2], x_ft.shape[3]
-        m1, m2 = min(self.m1, Hf), min(self.m2, Wf)
-        out_ft = torch.zeros((B, self.weights.shape[1], H, Wf), device=x.device, dtype=torch.cfloat)
-        w = torch.view_as_complex(self.weights)
-        x_slice = x_ft[:, :, :m1, :m2]
-        w_slice = w[:, :, :m1, :m2]
-        out_ft[:, :, :m1, :m2] = torch.einsum("bixy,ioxy->boxy", x_slice, w_slice)
-        return fft.irfftn(out_ft, s=(H, W), dim=(2, 3), norm="ortho")
-
-
 class FNO2dBlock(nn.Module):
     def __init__(self, in_c=64, modes1=20, modes2=10):
         super().__init__()
@@ -290,3 +267,61 @@ class Hybrid_WFDN_FNO(nn.Module):
         out = F.interpolate(fused, size=self.output_size,
                             mode="bilinear", align_corners=False)
         return out.float()  # 残差
+
+
+# ====================== Ghost Module ======================
+class GhostModule(nn.Module):
+    def __init__(self, in_channels, out_channels, ratio=2, kernel_size=1, dw_kernel_size=3, stride=1, relu=True):
+        super(GhostModule, self).__init__()
+        self.out_channels = out_channels
+        init_channels = int(out_channels / ratio)
+        new_channels = out_channels - init_channels
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(in_channels, init_channels, kernel_size, stride, kernel_size // 2, bias=False),
+            nn.BatchNorm2d(init_channels),
+            nn.ReLU(inplace=True) if relu else nn.Sequential()
+        )
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, dw_kernel_size, 1,
+                      dw_kernel_size // 2, groups=init_channels, bias=False),
+            nn.BatchNorm2d(new_channels),
+            nn.ReLU(inplace=True) if relu else nn.Sequential()
+        )
+    def forward(self, x):
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        out = torch.cat([x1, x2], dim=1)
+        return out[:, :self.out_channels, :, :]
+
+# ====================== Ghost WFDN Block ======================
+class GhostWFDNBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, expansion=2):
+        super(GhostWFDNBlock, self).__init__()
+        mid_channels = in_channels * expansion
+        self.conv1 = GhostModule(in_channels, mid_channels, ratio=2, kernel_size=1)
+        self.conv2 = GhostModule(mid_channels, out_channels, ratio=2, kernel_size=3)
+        self.shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+        return out + self.shortcut(x)
+
+class Hybrid_GhostWFDN_FNO(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=(100, 200)):
+        super(Hybrid_GhostWFDN_FNO, self).__init__()
+        self.stem = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        self.wfdn_blocks = nn.Sequential(*[GhostWFDNBlock(base_channels, base_channels) for _ in range(num_wfdn)])
+        self.fno_convs = nn.ModuleList(
+            [SpectralConv2d(base_channels, base_channels, m1=20, m2=10) for _ in range(num_fno)])
+        self.fno_ws = nn.ModuleList([nn.Conv2d(base_channels, base_channels, 1) for _ in range(num_fno)])
+        self.final = nn.Conv2d(base_channels, 1, 1)
+        self.output_size = output_size
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.wfdn_blocks(x)
+        for conv, w in zip(self.fno_convs, self.fno_ws):
+            x = F.gelu(conv(x) + w(x))
+        x = F.interpolate(x, size=self.output_size, mode="bilinear", align_corners=False)
+        out = self.final(x).float()
+        return out
+
