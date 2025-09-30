@@ -71,7 +71,7 @@ class PowderUNet(nn.Module):
     - concat normalized (Q,E) coordinate channels at HR
     - a shallow head + N residual blocks + tail conv -> 1-channel residual
     """
-    def __init__(self, scale_factor=(5, 10), nf=64, n_blocks=16, kq=3, ke=3):
+    def __init__(self, scale_factor=(5, 10), nf=64, n_blocks=16):
         super().__init__()
         self.scale_factor = scale_factor
 
@@ -293,6 +293,28 @@ class GhostModule(nn.Module):
         out = torch.cat([x1, x2], dim=1)
         return out[:, :self.out_channels, :, :]
 
+class GhostResidual(nn.Module):
+    # A residual block with ghost depthwise convolutions
+    def __init__(self, nf, ratio=2, kernel_size=1, dw_kernel_size=3, stride=1):
+        super(GhostResidual, self).__init__()
+        init_channels = int(nf / ratio)
+        new_channels = nf - init_channels
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(nf, init_channels, kernel_size, stride, kernel_size // 2, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(init_channels, init_channels, kernel_size, stride, kernel_size // 2, bias=False),
+        )
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, dw_kernel_size, 1,
+                      dw_kernel_size // 2, groups=init_channels, bias=False),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        out = torch.cat([x1, x2], dim=1)
+        return x + out
+
 # ====================== Ghost WFDN Block ======================
 class GhostWFDNBlock(nn.Module):
     def __init__(self, in_channels, out_channels, expansion=2):
@@ -321,7 +343,26 @@ class Hybrid_GhostWFDN_FNO(nn.Module):
         x = self.wfdn_blocks(x)
         for conv, w in zip(self.fno_convs, self.fno_ws):
             x = F.gelu(conv(x) + w(x))
-        x = F.interpolate(x, size=self.output_size, mode="bilinear", align_corners=False)
+        x = F.interpolate(x, size=self.output_size, mode="bicubic", align_corners=False)
         out = self.final(x).float()
         return out
 
+# Ghosted residual unet
+class GhostUNet(nn.Module):
+    def __init__(self, scale_factor=(5, 10), nf=64, n_blocks=4, nfno=2):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=False)
+        self.head = nn.Sequential(
+            nn.Conv2d(1, nf, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.body = nn.Sequential(*[GhostResidual(nf=nf, kernel_size=5) for _ in range(n_blocks)])
+        self.nfno = nfno
+        self.fno_conv = SpectralConv2d(nf, nf, m1=50, m2=1)
+        self.fno_ws = nn.Conv2d(nf, nf, 1)
+        self.tail = nn.Conv2d(nf, 1, kernel_size=3, padding=1)
+    def forward(self, x):
+        x = self.body(self.upsample(self.body(self.head(x))))
+        for i in range(self.nfno):
+            x = F.gelu(self.fno_conv(x) + self.fno_ws(x))
+        return self.tail(self.body(x)).float()
