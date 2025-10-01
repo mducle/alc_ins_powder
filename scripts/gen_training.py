@@ -24,7 +24,7 @@ sys.path.append(os.path.dirname(__file__))
 from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO, Hybrid_GhostWFDN_FNO
 
 # ============== Config ==============
-MATPROJ_APIKEY = '***REMOVED***'
+MATPROJ_APIKEY = ''
 BLACKLIST = {"Ac", "Th", "Pa", "U", "Np", "Pu"}
 SEED = 1001
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)

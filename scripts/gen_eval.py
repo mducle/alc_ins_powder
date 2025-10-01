@@ -23,7 +23,7 @@ from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO
 from gen_training import sanitize, gen_spec, get_struct, fetch_mp_ids, myMPDoc
  
 # ============== Config ==============
-MATPROJ_APIKEY = "***REMOVED***"
+MATPROJ_APIKEY = ""
 BLACKLIST = {"Ac", "Th", "Pa", "U", "Np", "Pu"}
 
 def plot_fig(y_true, y_pred, outdir, idstr, model_name, speedup):
