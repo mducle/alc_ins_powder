@@ -21,7 +21,7 @@ from euphonic import ureg
 # ---- model ----
 import sys
 sys.path.append(os.path.dirname(__file__))
-from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO, Hybrid_GhostWFDN_FNO
+from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO, Hybrid_GhostWFDN_FNO, GhostUNet
 
 # ============== Config ==============
 MATPROJ_APIKEY = ''
@@ -157,24 +157,44 @@ def gen_single(mp_id, do_plot=False, no_load=False, input_size=(20,20), output_s
 
     return z_coarse.flatten(), z_high.flatten()
 
-def collect_samples(mp_ids, need_n=None, input_size=(20,20), output_size=(100,200), npts=(200,1000)):
+def get_list(filename):
+    with open(filename) as f:
+        return [v.strip() for v in f.readlines()]
+
+def collect_samples(mp_ids, need_n=None, pic=False, bl='', input_size=(20,20), output_size=(100,200), npts=(200,1000)):
+    blacklist = get_list(bl) if bl else []
     need_n = need_n or len(mp_ids)
     inputs, targets, ok_ids, errors = [], [], [], []
     for mpid in mp_ids:
         if len(ok_ids) >= need_n:
             break
+        if str(mpid) in blacklist:
+            continue
         try:
             inp, tgt = gen_single(mpid, do_plot=False, input_size=input_size, output_size=output_size, npts=npts)
             if not (np.all(np.isfinite(inp)) and np.all(np.isfinite(tgt))):
                 raise ValueError("non-finite values in sample")
             inputs.append(inp); targets.append(tgt); ok_ids.append(mpid)
-            print(f"✓ {mpid}")
+            #print(f"✓ {mpid}")
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             print(f"✗ {mpid}: {msg}")
             errors.append((mpid, msg))
+        else:
+            if pic and not os.path.exists(f'janus_results/{mpid}.png'):
+                fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+                plot_ax(np.reshape(tgt, shape=output_size), fig, ax, 0, np.nanpercentile(tgt, 99.5), mpid)
+                fig.savefig(f'janus_results/{mpid}.png', dpi=180)
+                plt.close(fig)
     print(f"[summary] success: {len(ok_ids)}, failed: {len(errors)}")
     return inputs, targets, ok_ids, errors
+
+def plot_ax(yval, fig, ax, vmin, vmax, title):
+    im0 = ax.imshow(yval, origin="lower", aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
+    ax.set_title(title)
+    ax.set_xlabel("Energy bin")
+    ax.set_ylabel("|Q| bin")
+    fig.colorbar(im0, ax=ax).ax.set_ylabel("Intensity")
 
 # ---- Physics-aware losses ----
 def grad_loss(pred, gt):
@@ -204,7 +224,7 @@ def combined_loss(pred_hr, gt_hr, w_pix=1.0, w_grad=0.2, w_fft=0.1, q_axis_last=
 # ---- Train main ----
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', choices=['srcnn', 'unet', 'fno', 'wfdn_fno', 'ghost'], required=True)
+    parser.add_argument('--model', choices=['srcnn', 'unet', 'fno', 'wfdn_fno', 'ghost', 'ghostres'], required=True)
     parser.add_argument('--epochs', type=int, default=80)
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -213,6 +233,8 @@ def main():
     parser.add_argument('--input-size', type=str, default='20x20')
     parser.add_argument('--output-size', type=str, default='100x200')
     parser.add_argument('--npts', type=str, default='200-1000')
+    parser.add_argument('--pic', type=int, default=0)
+    parser.add_argument('--blacklist', type=str, default="")
     args = parser.parse_args()
 
     in_sz = tuple(int(v) for v in args.input_size.split('x'))
@@ -221,8 +243,11 @@ def main():
 
     mp_ids = fetch_mp_ids(MATPROJ_APIKEY, limit=args.limit, num_elements=(1, 3),
                           nsites_max=20, blacklist=BLACKLIST, oversample=10)
-    inputs, targets, ok_ids, errors = collect_samples(mp_ids, need_n=args.limit,
+    inputs, targets, ok_ids, errors = collect_samples(mp_ids, need_n=args.limit, pic=args.pic, bl=args.blacklist,
                                                      input_size=in_sz, output_size=out_sz, npts=npts)
+    if args.blacklist and errors:
+        with open(args.blacklist, 'a') as f:
+            f.write('\n'.join([e[0] for e in errors]))
 
     X = sanitize(np.vstack(inputs), clip_pct=99.9, nonneg=True)
     Y = sanitize(np.vstack(targets), clip_pct=99.9, nonneg=True)
@@ -246,9 +271,15 @@ def main():
         net = Hybrid_WFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
     elif args.model == 'ghost':
         net = Hybrid_GhostWFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
+    elif args.model == 'ghostres':
+        net = GhostUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     else:
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        if torch.cuda.device_count() > 1:
+            net = torch.nn.DataParallel(net)
     net = net.to(device).float()
 
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)

@@ -19,8 +19,8 @@ from euphonic import ureg
 # ---- Models ----
 import sys
 sys.path.append(os.path.dirname(__file__))
-from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO
-from gen_training import sanitize, gen_spec, get_struct, fetch_mp_ids, myMPDoc
+from model import SRCNN, PowderUNet, FNO2d, Hybrid_WFDN_FNO, Hybrid_GhostWFDN_FNO, GhostUNet
+from gen_training import sanitize, gen_spec, get_struct, fetch_mp_ids, myMPDoc, plot_ax
  
 # ============== Config ==============
 MATPROJ_APIKEY = ""
@@ -29,21 +29,9 @@ BLACKLIST = {"Ac", "Th", "Pa", "U", "Np", "Pu"}
 def plot_fig(y_true, y_pred, outdir, idstr, model_name, speedup):
     vmin = 0.0
     vmax = np.nanpercentile(np.concatenate([y_true.ravel(), y_pred.ravel()]), 99.5)
- 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
-    im0 = axes[0].imshow(y_true, origin="lower", aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
-    axes[0].set_title(f"Brute-force {idstr}")
-    axes[0].set_xlabel("Energy bin")
-    axes[0].set_ylabel("|Q| bin")
-    fig.colorbar(im0, ax=axes[0]).ax.set_ylabel("Intensity")
- 
-    im1 = axes[1].imshow(y_pred, origin="lower", aspect="auto", vmin=vmin, vmax=vmax, cmap="viridis")
-    axes[1].set_title(f"ML ({model_name}) x{speedup:.1f}")
-    axes[1].set_xlabel("Energy bin")
-    axes[1].set_ylabel("|Q| bin")
-    fig.colorbar(im1, ax=axes[1]).ax.set_ylabel("Intensity")
- 
-    os.makedirs("checkpoints", exist_ok=True)
+    plot_ax(y_true, fig, axes[0], vmin, vmax, f"Brute-force {idstr}")
+    plot_ax(y_pred, fig, axes[1], vmin, vmax, f"ML ({model_name}) x{speedup:.1f}")
     fig.savefig(f"{outdir}/pred_vs_gt{idstr}.png", dpi=180)
     plt.close(fig)
  
@@ -76,11 +64,15 @@ def main():
     elif model_name == "unet":
         net = PowderUNet(scale_factor=(out_sz[0] / in_sz[0], out_sz[1] / in_sz[1]))
     elif model_name == "wfdn_fno":
-        net = Hybrid_WFDN_FNO(
-            in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz
-        )
+        net = Hybrid_WFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
+    elif model_name == 'ghost':
+        net = Hybrid_GhostWFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
+    elif model_name == 'ghostres':
+        net = GhostUNet(scale_factor=(out_sz[0] / in_sz[0], out_sz[1] / in_sz[1]))
     else:
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
+    if list(state_dict.keys())[0].startswith('module.'):
+        net = torch.nn.DataParallel(net)
  
     net.load_state_dict(state_dict)
     net = net.to(device).eval()
