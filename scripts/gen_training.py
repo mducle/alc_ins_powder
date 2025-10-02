@@ -269,9 +269,9 @@ def main():
         net = PowderUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     elif args.model == 'wfdn_fno':
         net = Hybrid_WFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
-    elif args.model == 'ghost':
+    elif args.model == 'ghost_fdno':
         net = Hybrid_GhostWFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
-    elif args.model == 'ghostres':
+    elif args.model == 'ghost_unet':
         net = GhostUNet(scale_factor=(out_sz[0]/in_sz[0], out_sz[1]/in_sz[1]))
     else:
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
@@ -287,6 +287,7 @@ def main():
 
     best_val = float('inf')
     os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('janus_results', exist_ok=True)
     with open('checkpoints/val_metrics.csv', 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['epoch','val_loss','psnr','grad_loss','fourier_q'])

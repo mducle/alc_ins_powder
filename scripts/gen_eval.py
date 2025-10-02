@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--seed", type=int, default=2001)
     parser.add_argument("--dir", type=str, default="")
     args = parser.parse_args()
+    os.makedirs('janus_results', exist_ok=True)
  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
  
@@ -65,9 +66,9 @@ def main():
         net = PowderUNet(scale_factor=(out_sz[0] / in_sz[0], out_sz[1] / in_sz[1]))
     elif model_name == "wfdn_fno":
         net = Hybrid_WFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
-    elif model_name == 'ghost':
+    elif model_name == 'ghost_wfdn':
         net = Hybrid_GhostWFDN_FNO(in_channels=1, base_channels=64, num_wfdn=4, num_fno=2, output_size=out_sz)
-    elif model_name == 'ghostres':
+    elif model_name == 'ghost_unet':
         net = GhostUNet(scale_factor=(out_sz[0] / in_sz[0], out_sz[1] / in_sz[1]))
     else:
         net = FNO2d(modes1=20, modes2=10, width=64, output_size=out_sz)
